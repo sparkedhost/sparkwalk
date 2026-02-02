@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MichaelTJones/walk"
+	walk "github.com/sparkedhost/sparkwalk"
 )
 
 var LstatP = walk.LstatP
