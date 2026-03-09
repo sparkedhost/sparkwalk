@@ -2,22 +2,20 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package filepath implements utility routines for manipulating filename paths
-// in a way compatible with the target operating system-defined file paths.
+// Package walk implements a fast, parallel alternative to filepath.Walk.
 package walk
 
 import (
 	"errors"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 )
 
-// SkipDir is used as a return value from WalkFuncs to indicate that
+// ErrSkipDir is used as a return value from WalkFuncs to indicate that
 // the directory named in the call is to be skipped. It is not returned
 // as an error by any function.
-var SkipDir = errors.New("skip this directory")
+var ErrSkipDir = errors.New("skip this directory")
 
 // WalkFunc is the type of the function called for each file or directory
 // visited by Walk. The path argument contains the argument to Walk as a
@@ -29,7 +27,7 @@ var SkipDir = errors.New("skip this directory")
 // incoming error will describe the problem and the function can decide how
 // to handle that error (and Walk will not descend into that directory). If
 // an error is returned, processing stops. The sole exception is that if path
-// is a directory and the function returns the special value SkipDir, the
+// is a directory and the function returns the special value ErrSkipDir, the
 // contents of the directory are skipped and processing continues as usual on
 // the next file.
 type WalkFunc func(path string, info os.FileInfo, err error) error
@@ -63,7 +61,6 @@ func (ws *WalkState) setTerminated(err error) {
 		ws.firstError = err
 	}
 	ws.lock.Unlock()
-	return
 }
 
 func (ws *WalkState) visitChannel() {
@@ -80,7 +77,7 @@ func (ws *WalkState) visitFile(file VisitData) {
 
 	err := ws.walkFn(file.path, file.info, nil)
 	if err != nil {
-		if !(file.info.IsDir() && err == SkipDir) {
+		if err != ErrSkipDir {
 			ws.setTerminated(err)
 		}
 		return
@@ -94,18 +91,26 @@ func (ws *WalkState) visitFile(file VisitData) {
 	if err != nil {
 		err = ws.walkFn(file.path, file.info, err)
 		if err != nil {
+			if err == ErrSkipDir {
+				return
+			}
 			ws.setTerminated(err)
+			return
 		}
-		return
+		// walkFn returned nil — caller chose to ignore the error.
+		// Still iterate any partial names that readDirNames managed to collect.
 	}
 
 	here := file.path
 	for _, name := range names {
+		if ws.terminated() {
+			return
+		}
 		file.path = Join(here, name)
 		file.info, err = lstat(file.path)
 		if err != nil {
 			err = ws.walkFn(file.path, file.info, err)
-			if err != nil && (file.info == nil || !file.info.IsDir() || err != SkipDir) {
+			if err != nil && err != ErrSkipDir {
 				ws.setTerminated(err)
 				return
 			}
@@ -124,6 +129,9 @@ func (ws *WalkState) visitFile(file VisitData) {
 			case false:
 				err = ws.walkFn(file.path, file.info, nil)
 				if err != nil {
+					if err == ErrSkipDir {
+						return // skip remaining files in this directory
+					}
 					ws.setTerminated(err)
 					return
 				}
@@ -140,7 +148,11 @@ func (ws *WalkState) visitFile(file VisitData) {
 func Walk(root string, walkFn WalkFunc) error {
 	info, err := os.Lstat(root)
 	if err != nil {
-		return walkFn(root, nil, err)
+		err = walkFn(root, nil, err)
+		if err == ErrSkipDir {
+			return nil
+		}
+		return err
 	}
 
 	ws := &WalkState{
@@ -161,12 +173,8 @@ func Walk(root string, walkFn WalkFunc) error {
 	return ws.firstError
 }
 
-//
-// THE REMAINDER IS UNCHANGED FROM THE ORGINAL GO LIBRARY ORIGINAL
-//
-
 // readDirNames reads the directory named by dirname and returns
-// a sorted list of directory entries.
+// the directory entries in filesystem order.
 func readDirNames(dirname string) ([]string, error) {
 	f, err := os.Open(dirname)
 	if err != nil {
@@ -175,9 +183,8 @@ func readDirNames(dirname string) ([]string, error) {
 	names, err := f.Readdirnames(-1)
 	f.Close()
 	if err != nil {
-		return nil, err
+		return names, err // preserve partial names alongside the error
 	}
-	sort.Strings(names) // omit sort to save 1-2%
 	return names, nil
 }
 

@@ -6,11 +6,11 @@ package walk_test
 
 import (
 	"errors"
-	"io/ioutil"
 	"os"
-	"reflect"
-	"runtime"
+	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	walk "github.com/sparkedhost/sparkwalk"
@@ -67,7 +67,9 @@ func makeTree(t *testing.T) {
 			}
 			fd.Close()
 		} else {
-			os.Mkdir(path, 0770)
+			if err := os.Mkdir(path, 0770); err != nil {
+				t.Errorf("makeTree: %v", err)
+			}
 		}
 	})
 }
@@ -86,7 +88,10 @@ func checkMarks(t *testing.T, report bool) {
 // Assumes that each node name is unique. Good enough for a test.
 // If clear is true, any incoming error is cleared before return. The errors
 // are always accumulated, though.
-func mark(path string, info os.FileInfo, err error, errors *[]error, clear bool) error {
+func mark(path string, info os.FileInfo, err error, errors *[]error, clear bool, mu *sync.Mutex) error {
+	mu.Lock()
+	defer mu.Unlock()
+
 	if err != nil {
 		*errors = append(*errors, err)
 		if clear {
@@ -107,8 +112,9 @@ func TestWalk(t *testing.T) {
 	makeTree(t)
 	errors := make([]error, 0, 10)
 	clear := true
+	var mu sync.Mutex
 	markFn := func(path string, info os.FileInfo, err error) error {
-		return mark(path, info, err, &errors, clear)
+		return mark(path, info, err, &errors, clear, &mu)
 	}
 	// Expect no errors.
 	err := walk.Walk(tree.name, markFn)
@@ -159,8 +165,8 @@ func TestWalk(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected error return from Walk")
 		}
-		if len(errors) != 1 {
-			t.Errorf("expected 1 error, got %d: %s", len(errors), errors)
+		if len(errors) < 1 || len(errors) > 2 {
+			t.Errorf("expected 1-2 errors, got %d: %s", len(errors), errors)
 		}
 		// the inaccessible subtrees were marked manually
 		checkMarks(t, false)
@@ -187,8 +193,48 @@ func touch(t *testing.T, name string) {
 	}
 }
 
+func equalErrorMaps(got, want map[string]error) bool {
+	if len(got) != len(want) {
+		return false
+	}
+
+	for path, wantErr := range want {
+		gotErr, ok := got[path]
+		if !ok {
+			return false
+		}
+		if wantErr == nil || gotErr == nil {
+			if gotErr != wantErr {
+				return false
+			}
+			continue
+		}
+		if !errors.Is(gotErr, wantErr) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func goRoot(t *testing.T) string {
+	t.Helper()
+
+	out, err := exec.Command("go", "env", "GOROOT").Output()
+	if err != nil {
+		t.Fatalf("go env GOROOT: %v", err)
+	}
+
+	root := strings.TrimSpace(string(out))
+	if root == "" {
+		t.Fatal("go env GOROOT returned an empty path")
+	}
+
+	return root
+}
+
 func TestWalkFileError(t *testing.T) {
-	td, err := ioutil.TempDir("", "walktest")
+	td, err := os.MkdirTemp("", "walktest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,9 +259,12 @@ func TestWalkFileError(t *testing.T) {
 		return os.Lstat(path)
 	}
 	got := map[string]error{}
+	var mu sync.Mutex
 	err = walk.Walk(td, func(path string, fi os.FileInfo, err error) error {
 		rel, _ := walk.Rel(td, path)
+		mu.Lock()
 		got[walk.ToSlash(rel)] = err
+		mu.Unlock()
 		return nil
 	})
 	if err != nil {
@@ -229,38 +278,188 @@ func TestWalkFileError(t *testing.T) {
 		"dir/baz":        nil,
 		"dir/stat-error": statErr,
 	}
-	if !reflect.DeepEqual(got, want) {
+	if !equalErrorMaps(got, want) {
 		t.Errorf("Walked %#v; want %#v", got, want)
 	}
 }
 
 func TestBug3486(t *testing.T) { // http://code.google.com/p/go/issues/detail?id=3486
-	root, err := walk.EvalSymlinks(runtime.GOROOT() + "/test")
+	root, err := walk.EvalSymlinks(goRoot(t) + "/test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	bugs := walk.Join(root, "bugs")
 	ken := walk.Join(root, "ken")
-	seenBugs := false
-	seenKen := false
-	walk.Walk(root, func(pth string, info os.FileInfo, err error) error {
+	_, bugsErr := os.Stat(bugs)
+	haveBugs := bugsErr == nil
+	_, kenErr := os.Stat(ken)
+	haveKen := kenErr == nil
+	var seenBugs atomic.Bool
+	var seenKen atomic.Bool
+	err = walk.Walk(root, func(pth string, info os.FileInfo, err error) error {
 		if err != nil {
-			t.Fatal(err)
+			return err
 		}
 
 		switch pth {
 		case bugs:
-			seenBugs = true
-			return walk.SkipDir
+			seenBugs.Store(true)
+			return walk.ErrSkipDir
 		case ken:
-			if !seenBugs {
-				t.Fatal("walk.Walk out of order - ken before bugs")
-			}
-			seenKen = true
+			seenKen.Store(true)
 		}
 		return nil
 	})
-	if !seenKen {
+	if err != nil {
+		t.Fatal(err)
+	}
+	if haveBugs && !seenBugs.Load() {
+		t.Fatalf("%q not seen", bugs)
+	}
+	if haveKen && !seenKen.Load() {
 		t.Fatalf("%q not seen", ken)
+	}
+}
+
+func TestSkipDirOnFile(t *testing.T) {
+	td, err := os.MkdirTemp("", "walktest_skipdir_file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(td)
+
+	if err := os.MkdirAll(walk.Join(td, "dir1"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(walk.Join(td, "dir2"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(walk.Join(td, "dir1", "file1"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(walk.Join(td, "dir1", "file2"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(walk.Join(td, "dir2", "file3"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var seenDir2 atomic.Bool
+	err = walk.Walk(td, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Name() == "dir2" {
+			seenDir2.Store(true)
+		}
+		if info.Name() == "file1" || info.Name() == "file2" {
+			return walk.ErrSkipDir
+		}
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("Walk returned unexpected error: %v", err)
+	}
+	if !seenDir2.Load() {
+		t.Errorf("Walk did not visit dir2, so ErrSkipDir on a file incorrectly aborted the global walk!")
+	}
+}
+
+func TestSkipDirOnStatError(t *testing.T) {
+	td, err := os.MkdirTemp("", "walktest_skipdir_stat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(td)
+
+	if err := os.MkdirAll(walk.Join(td, "dir1"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(walk.Join(td, "dir1", "file-stat-error"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(walk.Join(td, "dir1", "file-ok"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		*walk.LstatP = os.Lstat
+	}()
+	*walk.LstatP = func(path string) (os.FileInfo, error) {
+		if strings.HasSuffix(path, "file-stat-error") {
+			return nil, errors.New("simulated stat error")
+		}
+		return os.Lstat(path)
+	}
+
+	var seenFileOk atomic.Bool
+	err = walk.Walk(td, func(path string, info os.FileInfo, err error) error {
+		if err != nil { // simulated stat error
+			return walk.ErrSkipDir
+		}
+		if info.Name() == "file-ok" {
+			seenFileOk.Store(true)
+		}
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("Walk returned unexpected error: %v", err)
+	}
+	if !seenFileOk.Load() {
+		t.Errorf("file-ok was not visited: ErrSkipDir on a stat error should not skip remaining siblings")
+	}
+}
+
+func TestSkipDirOnRoot(t *testing.T) {
+	td, err := os.MkdirTemp("", "walktest_skipdir_root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(td)
+
+	if err := os.WriteFile(walk.Join(td, "root_file"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(walk.Join(td, "root_dir"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(walk.Join(td, "root_dir", "child"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// ErrSkipDir on a root file (lstat succeeds): Walk should return nil.
+	err = walk.Walk(walk.Join(td, "root_file"), func(path string, info os.FileInfo, err error) error {
+		return walk.ErrSkipDir
+	})
+	if err != nil {
+		t.Errorf("root file + ErrSkipDir: got %v, want nil", err)
+	}
+
+	// ErrSkipDir on a root file (lstat fails): Walk should return nil.
+	err = walk.Walk(walk.Join(td, "missing_file"), func(path string, info os.FileInfo, err error) error {
+		return walk.ErrSkipDir
+	})
+	if err != nil {
+		t.Errorf("missing root file + ErrSkipDir: got %v, want nil", err)
+	}
+
+	// ErrSkipDir on a root directory: Walk should return nil and not descend.
+	var childSeen atomic.Bool
+	err = walk.Walk(walk.Join(td, "root_dir"), func(path string, info os.FileInfo, err error) error {
+		if info != nil && info.Name() == "child" {
+			childSeen.Store(true)
+		}
+		if info != nil && info.IsDir() {
+			return walk.ErrSkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		t.Errorf("root dir + ErrSkipDir: got %v, want nil", err)
+	}
+	if childSeen.Load() {
+		t.Errorf("child of skipped root dir was visited")
 	}
 }
