@@ -7,7 +7,10 @@ package walk
 
 import (
 	"errors"
+	"io"
 	"os"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -33,7 +36,6 @@ var ErrSkipDir = errors.New("skip this directory")
 type WalkFunc func(path string, info os.FileInfo, err error) error
 
 var lstat = os.Lstat // for testing
-var LstatP = &lstat
 
 type VisitData struct {
 	path string
@@ -41,11 +43,12 @@ type VisitData struct {
 }
 
 type WalkState struct {
-	walkFn     WalkFunc
-	v          chan VisitData // files to be processed
-	active     sync.WaitGroup // number of files to process
-	lock       sync.RWMutex
-	firstError error // accessed using lock
+	walkFn      WalkFunc
+	useFastPath bool
+	v           chan VisitData // files to be processed
+	active      sync.WaitGroup // number of files to process
+	lock        sync.RWMutex
+	firstError  error // accessed using lock
 }
 
 func (ws *WalkState) terminated() bool {
@@ -87,6 +90,63 @@ func (ws *WalkState) visitFile(file VisitData) {
 		return
 	}
 
+	if ws.useFastPath {
+		ws.visitDirFast(file)
+		return
+	}
+	ws.visitDirLstat(file)
+}
+
+func (ws *WalkState) visitDirFast(file VisitData) {
+	f, err := os.Open(file.path)
+	if err != nil {
+		err = ws.walkFn(file.path, file.info, err)
+		if err != nil {
+			if err == ErrSkipDir {
+				return
+			}
+			ws.setTerminated(err)
+			return
+		}
+		return
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			ws.setTerminated(closeErr)
+		}
+	}()
+
+	here := file.path
+	for {
+		entries, err := f.Readdir(readDirBatchSize)
+		for _, info := range entries {
+			if ws.terminated() {
+				return
+			}
+			if !ws.visitChild(here, info.Name(), info) {
+				return
+			}
+		}
+		if err == nil {
+			continue
+		}
+		if err == io.EOF {
+			return
+		}
+
+		err = ws.walkFn(file.path, file.info, err)
+		if err != nil {
+			if err == ErrSkipDir {
+				return
+			}
+			ws.setTerminated(err)
+			return
+		}
+		return
+	}
+}
+
+func (ws *WalkState) visitDirLstat(file VisitData) {
 	names, err := readDirNames(file.path)
 	if err != nil {
 		err = ws.walkFn(file.path, file.info, err)
@@ -106,38 +166,53 @@ func (ws *WalkState) visitFile(file VisitData) {
 		if ws.terminated() {
 			return
 		}
-		file.path = Join(here, name)
-		file.info, err = lstat(file.path)
+		child := VisitData{path: joinChildPath(here, name)}
+		child.info, err = lstat(child.path)
 		if err != nil {
-			err = ws.walkFn(file.path, file.info, err)
+			err = ws.walkFn(child.path, child.info, err)
 			if err != nil && err != ErrSkipDir {
 				ws.setTerminated(err)
 				return
 			}
-		} else {
-			switch file.info.IsDir() {
-			case true:
-				ws.active.Add(1) // presume channel send will succeed
-				select {
-				case ws.v <- file:
-					// push directory info to queue for concurrent traversal
-				default:
-					// undo increment when send fails and handle now
-					ws.active.Add(-1)
-					ws.visitFile(file)
-				}
-			case false:
-				err = ws.walkFn(file.path, file.info, nil)
-				if err != nil {
-					if err == ErrSkipDir {
-						return // skip remaining files in this directory
-					}
-					ws.setTerminated(err)
-					return
-				}
-			}
+			continue
+		}
+
+		if !ws.handleChild(child) {
+			return
 		}
 	}
+}
+
+func (ws *WalkState) visitChild(dir, name string, info os.FileInfo) bool {
+	return ws.handleChild(VisitData{
+		path: joinChildPath(dir, name),
+		info: info,
+	})
+}
+
+func (ws *WalkState) handleChild(child VisitData) bool {
+	if child.info.IsDir() {
+		ws.active.Add(1) // presume channel send will succeed
+		select {
+		case ws.v <- child:
+			// push directory info to queue for concurrent traversal
+		default:
+			// undo increment when send fails and handle now
+			ws.active.Add(-1)
+			ws.visitFile(child)
+		}
+		return true
+	}
+
+	err := ws.walkFn(child.path, child.info, nil)
+	if err != nil {
+		if err == ErrSkipDir {
+			return false // skip remaining files in this directory
+		}
+		ws.setTerminated(err)
+		return false
+	}
+	return true
 }
 
 // Walk walks the file tree rooted at root, calling walkFn for each file or
@@ -156,16 +231,17 @@ func Walk(root string, walkFn WalkFunc) error {
 	}
 
 	ws := &WalkState{
-		walkFn: walkFn,
-		v:      make(chan VisitData, 1024),
+		walkFn:      walkFn,
+		useFastPath: usingDefaultLstat(),
+		v:           make(chan VisitData, 1024),
 	}
 	defer close(ws.v)
 
 	ws.active.Add(1)
 	ws.v <- VisitData{root, info}
 
-	walkers := 16
-	for i := 0; i < walkers; i++ {
+	walkers := workerCount()
+	for range walkers {
 		go ws.visitChannel()
 	}
 	ws.active.Wait()
@@ -181,11 +257,28 @@ func readDirNames(dirname string) ([]string, error) {
 		return nil, err
 	}
 	names, err := f.Readdirnames(-1)
-	f.Close()
+	closeErr := f.Close()
 	if err != nil {
 		return names, err // preserve partial names alongside the error
 	}
+	if closeErr != nil {
+		return names, closeErr
+	}
 	return names, nil
+}
+
+func joinChildPath(dir, name string) string {
+	if dir == "" {
+		return name
+	}
+	if os.IsPathSeparator(dir[len(dir)-1]) {
+		return dir + name
+	}
+	return dir + separatorString + name
+}
+
+func usingDefaultLstat() bool {
+	return reflect.ValueOf(lstat).Pointer() == reflect.ValueOf(os.Lstat).Pointer()
 }
 
 // A lazybuf is a lazily constructed path buffer.
@@ -231,6 +324,21 @@ const (
 	Separator     = os.PathSeparator
 	ListSeparator = os.PathListSeparator
 )
+
+var separatorString = string(Separator)
+
+const readDirBatchSize = 1024
+
+func workerCount() int {
+	workers := runtime.GOMAXPROCS(0) * 4
+	if workers < 8 {
+		return 8
+	}
+	if workers > 64 {
+		return 64
+	}
+	return workers
+}
 
 // Clean returns the shortest path name equivalent to path
 // by purely lexical processing.  It applies the following rules
@@ -334,7 +442,7 @@ func ToSlash(path string) string {
 	if Separator == '/' {
 		return path
 	}
-	return strings.Replace(path, string(Separator), "/", -1)
+	return strings.ReplaceAll(path, string(Separator), "/")
 }
 
 // FromSlash returns the result of replacing each slash ('/') character
@@ -344,7 +452,7 @@ func FromSlash(path string) string {
 	if Separator == '/' {
 		return path
 	}
-	return strings.Replace(path, "/", string(Separator), -1)
+	return strings.ReplaceAll(path, "/", string(Separator))
 }
 
 // Join joins any number of path elements into a single path, adding
@@ -420,7 +528,7 @@ func Rel(basepath, targpath string) (string, error) {
 		}
 		buf := make([]byte, size)
 		n := copy(buf, "..")
-		for i := 0; i < seps; i++ {
+		for range seps {
 			buf[n] = Separator
 			copy(buf[n+1:], "..")
 			n += 3

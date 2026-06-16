@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package walk_test
+package walk
 
 import (
 	"errors"
@@ -12,11 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-
-	walk "github.com/sparkedhost/sparkwalk"
 )
-
-var LstatP = walk.LstatP
 
 type Node struct {
 	name    string
@@ -53,7 +49,7 @@ var tree = &Node{
 func walkTree(n *Node, path string, f func(path string, n *Node)) {
 	f(path, n)
 	for _, e := range n.entries {
-		walkTree(e, walk.Join(path, e.name), f)
+		walkTree(e, Join(path, e.name), f)
 	}
 }
 
@@ -65,13 +61,29 @@ func makeTree(t *testing.T) {
 				t.Errorf("makeTree: %v", err)
 				return
 			}
-			fd.Close()
+			if err := fd.Close(); err != nil {
+				t.Errorf("makeTree: %v", err)
+			}
 		} else {
 			if err := os.Mkdir(path, 0770); err != nil {
 				t.Errorf("makeTree: %v", err)
 			}
 		}
 	})
+}
+
+func requireRemoveAll(t *testing.T, path string) {
+	t.Helper()
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatalf("remove %s: %v", path, err)
+	}
+}
+
+func requireChmod(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatalf("chmod %s: %v", path, err)
+	}
 }
 
 func markTree(n *Node) { walkTree(n, "", func(path string, n *Node) { n.mark++ }) }
@@ -117,7 +129,7 @@ func TestWalk(t *testing.T) {
 		return mark(path, info, err, &errors, clear, &mu)
 	}
 	// Expect no errors.
-	err := walk.Walk(tree.name, markFn)
+	err := Walk(tree.name, markFn)
 	if err != nil {
 		t.Fatalf("no error expected, found: %s", err)
 	}
@@ -132,8 +144,8 @@ func TestWalk(t *testing.T) {
 	// all.bash on those file systems, skip during go test -short.
 	if os.Getuid() > 0 && !testing.Short() {
 		// introduce 2 errors: chmod top-level directories to 0
-		os.Chmod(walk.Join(tree.name, tree.entries[1].name), 0)
-		os.Chmod(walk.Join(tree.name, tree.entries[3].name), 0)
+		requireChmod(t, Join(tree.name, tree.entries[1].name), 0)
+		requireChmod(t, Join(tree.name, tree.entries[3].name), 0)
 
 		// 3) capture errors, expect two.
 		// mark respective subtrees manually
@@ -142,7 +154,7 @@ func TestWalk(t *testing.T) {
 		// correct double-marking of directory itself
 		tree.entries[1].mark--
 		tree.entries[3].mark--
-		err := walk.Walk(tree.name, markFn)
+		err := Walk(tree.name, markFn)
 		if err != nil {
 			t.Fatalf("expected no error return from Walk, got %s", err)
 		}
@@ -161,7 +173,7 @@ func TestWalk(t *testing.T) {
 		tree.entries[1].mark--
 		tree.entries[3].mark--
 		clear = false // error will stop processing
-		err = walk.Walk(tree.name, markFn)
+		err = Walk(tree.name, markFn)
 		if err == nil {
 			t.Fatalf("expected error return from Walk")
 		}
@@ -173,8 +185,8 @@ func TestWalk(t *testing.T) {
 		errors = errors[0:0]
 
 		// restore permissions
-		os.Chmod(walk.Join(tree.name, tree.entries[1].name), 0770)
-		os.Chmod(walk.Join(tree.name, tree.entries[3].name), 0770)
+		requireChmod(t, Join(tree.name, tree.entries[1].name), 0770)
+		requireChmod(t, Join(tree.name, tree.entries[3].name), 0770)
 	}
 
 	// cleanup
@@ -238,21 +250,21 @@ func TestWalkFileError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(td)
+	defer requireRemoveAll(t, td)
 
-	touch(t, walk.Join(td, "foo"))
-	touch(t, walk.Join(td, "bar"))
-	dir := walk.Join(td, "dir")
-	if err := os.MkdirAll(walk.Join(td, "dir"), 0755); err != nil {
+	touch(t, Join(td, "foo"))
+	touch(t, Join(td, "bar"))
+	dir := Join(td, "dir")
+	if err := os.MkdirAll(Join(td, "dir"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	touch(t, walk.Join(dir, "baz"))
-	touch(t, walk.Join(dir, "stat-error"))
+	touch(t, Join(dir, "baz"))
+	touch(t, Join(dir, "stat-error"))
 	defer func() {
-		*walk.LstatP = os.Lstat
+		lstat = os.Lstat
 	}()
 	statErr := errors.New("some stat error")
-	*walk.LstatP = func(path string) (os.FileInfo, error) {
+	lstat = func(path string) (os.FileInfo, error) {
 		if strings.HasSuffix(path, "stat-error") {
 			return nil, statErr
 		}
@@ -260,10 +272,10 @@ func TestWalkFileError(t *testing.T) {
 	}
 	got := map[string]error{}
 	var mu sync.Mutex
-	err = walk.Walk(td, func(path string, fi os.FileInfo, err error) error {
-		rel, _ := walk.Rel(td, path)
+	err = Walk(td, func(path string, fi os.FileInfo, err error) error {
+		rel, _ := Rel(td, path)
 		mu.Lock()
-		got[walk.ToSlash(rel)] = err
+		got[ToSlash(rel)] = err
 		mu.Unlock()
 		return nil
 	})
@@ -284,19 +296,19 @@ func TestWalkFileError(t *testing.T) {
 }
 
 func TestBug3486(t *testing.T) { // http://code.google.com/p/go/issues/detail?id=3486
-	root, err := walk.EvalSymlinks(goRoot(t) + "/test")
+	root, err := EvalSymlinks(goRoot(t) + "/test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	bugs := walk.Join(root, "bugs")
-	ken := walk.Join(root, "ken")
+	bugs := Join(root, "bugs")
+	ken := Join(root, "ken")
 	_, bugsErr := os.Stat(bugs)
 	haveBugs := bugsErr == nil
 	_, kenErr := os.Stat(ken)
 	haveKen := kenErr == nil
 	var seenBugs atomic.Bool
 	var seenKen atomic.Bool
-	err = walk.Walk(root, func(pth string, info os.FileInfo, err error) error {
+	err = Walk(root, func(pth string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -304,7 +316,7 @@ func TestBug3486(t *testing.T) { // http://code.google.com/p/go/issues/detail?id
 		switch pth {
 		case bugs:
 			seenBugs.Store(true)
-			return walk.ErrSkipDir
+			return ErrSkipDir
 		case ken:
 			seenKen.Store(true)
 		}
@@ -326,26 +338,26 @@ func TestSkipDirOnFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(td)
+	defer requireRemoveAll(t, td)
 
-	if err := os.MkdirAll(walk.Join(td, "dir1"), 0755); err != nil {
+	if err := os.MkdirAll(Join(td, "dir1"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(walk.Join(td, "dir2"), 0755); err != nil {
+	if err := os.MkdirAll(Join(td, "dir2"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(walk.Join(td, "dir1", "file1"), nil, 0644); err != nil {
+	if err := os.WriteFile(Join(td, "dir1", "file1"), nil, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(walk.Join(td, "dir1", "file2"), nil, 0644); err != nil {
+	if err := os.WriteFile(Join(td, "dir1", "file2"), nil, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(walk.Join(td, "dir2", "file3"), nil, 0644); err != nil {
+	if err := os.WriteFile(Join(td, "dir2", "file3"), nil, 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	var seenDir2 atomic.Bool
-	err = walk.Walk(td, func(path string, info os.FileInfo, err error) error {
+	err = Walk(td, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -353,7 +365,7 @@ func TestSkipDirOnFile(t *testing.T) {
 			seenDir2.Store(true)
 		}
 		if info.Name() == "file1" || info.Name() == "file2" {
-			return walk.ErrSkipDir
+			return ErrSkipDir
 		}
 		return nil
 	})
@@ -371,22 +383,22 @@ func TestSkipDirOnStatError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(td)
+	defer requireRemoveAll(t, td)
 
-	if err := os.MkdirAll(walk.Join(td, "dir1"), 0755); err != nil {
+	if err := os.MkdirAll(Join(td, "dir1"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(walk.Join(td, "dir1", "file-stat-error"), nil, 0644); err != nil {
+	if err := os.WriteFile(Join(td, "dir1", "file-stat-error"), nil, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(walk.Join(td, "dir1", "file-ok"), nil, 0644); err != nil {
+	if err := os.WriteFile(Join(td, "dir1", "file-ok"), nil, 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	defer func() {
-		*walk.LstatP = os.Lstat
+		lstat = os.Lstat
 	}()
-	*walk.LstatP = func(path string) (os.FileInfo, error) {
+	lstat = func(path string) (os.FileInfo, error) {
 		if strings.HasSuffix(path, "file-stat-error") {
 			return nil, errors.New("simulated stat error")
 		}
@@ -394,9 +406,9 @@ func TestSkipDirOnStatError(t *testing.T) {
 	}
 
 	var seenFileOk atomic.Bool
-	err = walk.Walk(td, func(path string, info os.FileInfo, err error) error {
+	err = Walk(td, func(path string, info os.FileInfo, err error) error {
 		if err != nil { // simulated stat error
-			return walk.ErrSkipDir
+			return ErrSkipDir
 		}
 		if info.Name() == "file-ok" {
 			seenFileOk.Store(true)
@@ -417,29 +429,29 @@ func TestSkipDirOnRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(td)
+	defer requireRemoveAll(t, td)
 
-	if err := os.WriteFile(walk.Join(td, "root_file"), nil, 0644); err != nil {
+	if err := os.WriteFile(Join(td, "root_file"), nil, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(walk.Join(td, "root_dir"), 0755); err != nil {
+	if err := os.MkdirAll(Join(td, "root_dir"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(walk.Join(td, "root_dir", "child"), nil, 0644); err != nil {
+	if err := os.WriteFile(Join(td, "root_dir", "child"), nil, 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	// ErrSkipDir on a root file (lstat succeeds): Walk should return nil.
-	err = walk.Walk(walk.Join(td, "root_file"), func(path string, info os.FileInfo, err error) error {
-		return walk.ErrSkipDir
+	err = Walk(Join(td, "root_file"), func(path string, info os.FileInfo, err error) error {
+		return ErrSkipDir
 	})
 	if err != nil {
 		t.Errorf("root file + ErrSkipDir: got %v, want nil", err)
 	}
 
 	// ErrSkipDir on a root file (lstat fails): Walk should return nil.
-	err = walk.Walk(walk.Join(td, "missing_file"), func(path string, info os.FileInfo, err error) error {
-		return walk.ErrSkipDir
+	err = Walk(Join(td, "missing_file"), func(path string, info os.FileInfo, err error) error {
+		return ErrSkipDir
 	})
 	if err != nil {
 		t.Errorf("missing root file + ErrSkipDir: got %v, want nil", err)
@@ -447,12 +459,12 @@ func TestSkipDirOnRoot(t *testing.T) {
 
 	// ErrSkipDir on a root directory: Walk should return nil and not descend.
 	var childSeen atomic.Bool
-	err = walk.Walk(walk.Join(td, "root_dir"), func(path string, info os.FileInfo, err error) error {
+	err = Walk(Join(td, "root_dir"), func(path string, info os.FileInfo, err error) error {
 		if info != nil && info.Name() == "child" {
 			childSeen.Store(true)
 		}
 		if info != nil && info.IsDir() {
-			return walk.ErrSkipDir
+			return ErrSkipDir
 		}
 		return nil
 	})

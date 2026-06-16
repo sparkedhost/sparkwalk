@@ -4,7 +4,9 @@ Fast parallel, Linux/amd64-only alternative to `filepath.Walk`.
 
 import `"github.com/sparkedhost/sparkwalk"`
 
-Performs traversals in parallel using 16 worker goroutines. The result is roughly 4–6× the traversal rate of the standard `filepath.Walk`. The two are not identical since `walkFn` is called concurrently from multiple goroutines. Take note of the following:
+Performs traversals in parallel using an adaptive worker pool based on `GOMAXPROCS` and is tuned for high-throughput directory walking on large trees. It is API-compatible with `filepath.Walk`, but not behaviorally identical in execution model because `walkFn` is called concurrently from multiple goroutines.
+
+Take note of the following:
 
 1. This walk honors all of the `WalkFunc` error semantics. When multiple goroutines simultaneously decide to stop traversal, only the **first** error is returned from `Walk`.
 
@@ -14,7 +16,7 @@ Performs traversals in parallel using 16 worker goroutines. The result is roughl
 
 4. The sentinel value for skipping a directory is `walk.ErrSkipDir` (note: `ErrSkipDir`, not `SkipDir`).
 
-5. Partial directory reads (e.g. from overlay2 whiteout entries returning `EBADMSG`) are handled gracefully: if `walkFn` returns `nil` for the error, traversal continues over any entries that were read before the failure.
+5. Partial directory reads are handled gracefully: if `walkFn` returns `nil` for the error, traversal continues over any entries that were read before the failure.
 
 There is a test file covering the same cases as `path/filepath` in the Go standard library.
 
